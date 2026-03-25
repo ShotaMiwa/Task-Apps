@@ -1,11 +1,12 @@
 # タスク成長型SNS PvPアプリ システム設計書
 
-**バージョン:** 1.3.0　　**作成日:** 2026年3月
+**バージョン:** 1.4.0　　**作成日:** 2026年3月
 
 ## 更新履歴
 
 | バージョン | 内容 |
 |---|---|
+| v1.4.0 | end_time をサーバー記録方式に変更・フォロー機能追加（DB・ファイル構成・処理フロー） |
 | v1.3.0 | 勝率同率時の昇格・降格タイブレーカーを追加 |
 | v1.2.0 | 第2回レビュー指摘事項を反映 |
 | v1.1.0 | レビュー指摘事項を反映 |
@@ -69,12 +70,14 @@
 | `routes/timecircle.js` | タイムサークルエンドポイント定義 |
 | `routes/timeline.js` | タイムラインエンドポイント定義 |
 | `routes/league.js` | リーグ・バトルエンドポイント定義 |
+| `routes/follows.js` | フォローエンドポイント定義 |
 | `controllers/auth.js` | 認証ビジネスロジック |
 | `controllers/avatar.js` | アバタービジネスロジック |
 | `controllers/tasks.js` | タスクビジネスロジック |
 | `controllers/timecircle.js` | タイムサークルビジネスロジック |
 | `controllers/timeline.js` | タイムラインビジネスロジック |
 | `controllers/league.js` | リーグ・バトルビジネスロジック |
+| `controllers/follows.js` | フォロービジネスロジック |
 | `batch/dailyBattle.js` | デイリーバトルバッチ処理 (node-cron) |
 
 ### 4.2 フロントエンド (`apps/mobile/`)
@@ -115,6 +118,10 @@
 | GET | `/v1/timeline` | タイムライン取得 | 必要 |
 | GET | `/v1/league` | リーグ・ランキング取得 | 必要 |
 | GET | `/v1/battles` | 直近バトル結果 | 必要 |
+| POST | `/v1/follows/:user_id` | フォローする | 必要 |
+| DELETE | `/v1/follows/:user_id` | フォロー解除する | 必要 |
+| GET | `/v1/follows/following` | 自分のフォロー一覧 | 必要 |
+| GET | `/v1/follows/followers` | 自分のフォロワー一覧 | 必要 |
 
 ---
 
@@ -142,7 +149,7 @@
 | 2 | アバターが存在しない場合は `404 NOT_FOUND` を返す（message: "アバターが作成されていません"） |
 | 3 | サーバーが `start_time` を記録し `in_progress` 状態で保存 |
 | 4 | 未完了タスクが既に存在する場合は `409 CONFLICT` を返す（message: "進行中のタスクがあります。先に終了してください"） |
-| 5 | `PATCH /v1/tasks/:id/end` で `end_time` を送信 |
+| 5 | `PATCH /v1/tasks/:id/end` をリクエスト。`end_time = now()` をサーバーが記録 |
 | 6 | `duration_minutes = (end_time - start_time)` を自動計算 |
 | 7 | `exp = duration_minutes × 10` を計算 |
 | 8 | カテゴリの `ratio × exp` でステータス増加量を計算 |
@@ -150,7 +157,27 @@
 | 10 | `avatars` テーブルのステータスを更新 |
 | 11 | `league_memberships` の `last_task_at` を更新 |
 
-### 6.3 デイリーバトルフロー
+### 6.3 フォローフロー
+
+| ステップ | 処理 |
+|---|---|
+| 1 | `POST /v1/follows/:user_id` でフォロー対象を指定 |
+| 2 | `follower_id === followee_id` の場合は `400 VALIDATION_ERROR` を返す |
+| 3 | すでにフォロー済みの場合は `409 CONFLICT` を返す（DB の一意制約違反を利用） |
+| 4 | `follows` テーブルに `(follower_id, followee_id)` を挿入 |
+| 5 | フォロー解除は `DELETE /v1/follows/:user_id` でレコードを削除。存在しない場合は `404 NOT_FOUND` |
+
+### 6.4 タイムライン取得フロー
+
+| ステップ | 処理 |
+|---|---|
+| 1 | `GET /v1/timeline` をリクエスト |
+| 2 | `visibility = public` のタスクは全件取得 |
+| 3 | `visibility = followers` のタスクは `follows` テーブルを参照し、リクエストユーザーがフォローしている投稿者のものだけ取得 |
+| 4 | `visibility = private` のタスクは除外 |
+| 5 | `posted_at` 降順でソートして返却 |
+
+### 6.5 デイリーバトルフロー
 
 | 時刻 | ステップ | 処理 |
 |---|---|---|
@@ -169,7 +196,7 @@
 | 06:00 | 13 | 昇格: 勝率（`wins / match_count`）上位 `floor(リーグ人数 × 0.2)` 人を上位リーグへ（S リーグは昇格なし）。同率の場合は総戦闘力（`base_power`）で判断 |
 | 06:00 | 14 | 降格: 勝率（`wins / match_count`）下位 `floor(リーグ人数 × 0.2)` 人を下位リーグへ（C リーグは降格なし）。同率の場合は総戦闘力（`base_power`）で判断 |
 
-### 6.4 マッチング詳細
+### 6.6 マッチング詳細
 
 | ケース | 挙動 |
 |---|---|
@@ -218,7 +245,23 @@ level = floor( sqrt(total_exp / 100) )
 
 ---
 
-## 8. エラーハンドリング方針
+## 8. DBテーブル定義
+
+### 8.1 follows テーブル
+
+```sql
+CREATE TABLE follows (
+  follower_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  followee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (follower_id, followee_id),
+  CHECK (follower_id <> followee_id)  -- 自己フォロー防止
+);
+```
+
+---
+
+## 9. エラーハンドリング方針
 
 | HTTP ステータス | code | 説明 |
 |---|---|---|
@@ -226,16 +269,16 @@ level = floor( sqrt(total_exp / 100) )
 | 401 | `UNAUTHORIZED` | 認証失敗・トークン期限切れ・無効 |
 | 403 | `FORBIDDEN` | アクセス権限なし |
 | 404 | `NOT_FOUND` | リソースが存在しない |
-| 409 | `CONFLICT` | 重複登録（アバター作成済み・タスク進行中） |
+| 409 | `CONFLICT` | 重複登録（アバター作成済み・タスク進行中・フォロー済み） |
 | 500 | `INTERNAL_ERROR` | サーバー内部エラー |
 
-### 8.1 エラーレスポンス共通形式
+### 9.1 エラーレスポンス共通形式
 
 ```json
 { "error": { "code": "UNAUTHORIZED", "message": "認証トークンが無効です" } }
 ```
 
-### 8.2 方針
+### 9.2 方針
 
 - 全ての controller は try-catch で囲み、500 エラーを必ずログ出力する
 - クライアントには詳細なスタックトレースを返さない
@@ -245,7 +288,7 @@ level = floor( sqrt(total_exp / 100) )
 
 ---
 
-## 9. ブランチ運用ルール
+## 10. ブランチ運用ルール
 
 | ブランチ | 用途 | マージ先 |
 |---|---|---|
@@ -254,7 +297,7 @@ level = floor( sqrt(total_exp / 100) )
 | `feature/xxx` | 機能ごとの作業ブランチ | `develop` |
 | `fix/xxx` | バグ修正ブランチ | `develop` |
 
-### 9.1 開発フロー
+### 10.1 開発フロー
 
 - `develop` から `feature/xxx` ブランチを切る
 - 実装・動作確認後に PR を出す
@@ -263,9 +306,9 @@ level = floor( sqrt(total_exp / 100) )
 
 ---
 
-## 10. コーディング規約
+## 11. コーディング規約
 
-### 10.1 命名規則
+### 11.1 命名規則
 
 | 対象 | スタイル | 例 |
 |---|---|---|
@@ -275,7 +318,7 @@ level = floor( sqrt(total_exp / 100) )
 | DB カラム | snake_case | `task_name`, `start_time` |
 | 環境変数 | UPPER_SNAKE_CASE | `DATABASE_URL` |
 
-### 10.2 コード規約
+### 11.2 コード規約
 
 - インデントはスペース 2 つ
 - 文字列はシングルクォート (`'`) を使う
@@ -284,7 +327,7 @@ level = floor( sqrt(total_exp / 100) )
 - controller は必ず try-catch で囲む
 - `console.log` はデバッグ用のみ。本番コードには残さない
 
-### 10.3 コミットメッセージ規約
+### 11.3 コミットメッセージ規約
 
 | プレフィックス | 用途 | 例 |
 |---|---|---|
