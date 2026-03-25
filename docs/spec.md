@@ -1,11 +1,12 @@
 # タスク成長型SNS PvPアプリ 仕様書（MVP）
 
-**バージョン:** 2.0.0　　**作成日:** 2026年3月
+**バージョン:** 2.1.0　　**作成日:** 2026年3月
 
 ## 更新履歴
 
 | バージョン | 内容 |
 |---|---|
+| v2.1.0 | end_time をサーバー記録方式に変更・フォロー機能をMVPに追加 |
 | v2.0.0 | 設計書 v1.3.0 との整合性を全面的に反映（エンドポイント・フロー・エラーハンドリング等） |
 | v1.0.0 | 初版作成 |
 
@@ -125,7 +126,7 @@ flowchart TD
 | タイミング | 送信項目 | 説明 |
 |---|---|---|
 | タイマー開始時 | `task_name`、`category`、`visibility` | タスク名・カテゴリ・公開設定を送信。`start_time` はサーバーが記録 |
-| タイマー終了時 | `end_time` | 終了時刻を送信。`duration_minutes` はサーバーが自動計算 |
+| タイマー終了時 | なし | リクエストを送るだけ。`end_time` はサーバーが `now()` で記録。`duration_minutes` はサーバーが自動計算 |
 
 ### 6.1 タスクカテゴリ
 
@@ -361,6 +362,10 @@ flowchart TD
 | GET | `/v1/timeline` | タイムライン取得 | 必要 |
 | GET | `/v1/league` | リーグ・ランキング取得 | 必要 |
 | GET | `/v1/battles` | 直近バトル結果 | 必要 |
+| POST | `/v1/follows/:user_id` | フォローする | 必要 |
+| DELETE | `/v1/follows/:user_id` | フォロー解除する | 必要 |
+| GET | `/v1/follows/following` | 自分のフォロー一覧 | 必要 |
+| GET | `/v1/follows/followers` | 自分のフォロワー一覧 | 必要 |
 
 ### 12.4 認証
 
@@ -473,10 +478,7 @@ flowchart TD
 **PATCH /v1/tasks/:id/end**
 
 ```json
-// Request
-{
-  "end_time": "2025-04-01T10:30:00Z"
-}
+// Request Body: なし
 
 // Response 200
 {
@@ -484,7 +486,7 @@ flowchart TD
   "task_name": "数学勉強",
   "category": "学習",
   "start_time": "2025-04-01T09:00:00Z",
-  "end_time": "2025-04-01T10:30:00Z",
+  "end_time": "2025-04-01T10:30:00Z",  // サーバーが now() で記録
   "duration_minutes": 90,
   "exp_gained": 900,
   "status_gain": {
@@ -565,7 +567,55 @@ flowchart TD
 }
 ```
 
-### 12.9 リーグ・バトル
+タイムラインの表示条件は以下の通り。
+
+| visibility | 表示条件 |
+|---|---|
+| `public` | 全ユーザーに表示 |
+| `followers` | リクエストユーザーがその投稿者をフォローしている場合のみ表示 |
+| `private` | 表示しない |
+
+### 12.9 フォロー
+
+**POST /v1/follows/:user_id**
+
+```json
+// Response 201
+{
+  "followee_id": "uuid",
+  "followed_at": "2025-04-01T09:00:00Z"
+}
+```
+
+**DELETE /v1/follows/:user_id**
+
+```
+// Response 204: No Content
+```
+
+**GET /v1/follows/following**
+
+```json
+// Response 200
+{
+  "following": [
+    { "user_id": "uuid", "username": "hanako" }
+  ]
+}
+```
+
+**GET /v1/follows/followers**
+
+```json
+// Response 200
+{
+  "followers": [
+    { "user_id": "uuid", "username": "jiro" }
+  ]
+}
+```
+
+### 12.10 リーグ・バトル
 
 **GET /v1/league**
 
@@ -613,7 +663,7 @@ flowchart TD
 | 401 | `UNAUTHORIZED` | 認証失敗・トークン期限切れ・無効 |
 | 403 | `FORBIDDEN` | アクセス権限なし |
 | 404 | `NOT_FOUND` | リソースが存在しない |
-| 409 | `CONFLICT` | 重複登録（アバター作成済み・タスク進行中） |
+| 409 | `CONFLICT` | 重複登録（アバター作成済み・タスク進行中・フォロー済み） |
 | 500 | `INTERNAL_ERROR` | サーバー内部エラー |
 
 ### 13.1 エラーレスポンス共通形式
@@ -622,7 +672,15 @@ flowchart TD
 { "error": { "code": "UNAUTHORIZED", "message": "認証トークンが無効です" } }
 ```
 
-### 13.2 方針
+### 13.2 フォロー操作のエラー
+
+| ケース | HTTPステータス | code | メッセージ |
+|---|---|---|---|
+| 自分自身をフォロー | 400 | `VALIDATION_ERROR` | 自分自身はフォローできません |
+| すでにフォロー済み | 409 | `CONFLICT` | すでにフォローしています |
+| フォローしていないユーザーを解除 | 404 | `NOT_FOUND` | フォロー関係が存在しません |
+
+### 13.3 方針
 
 - 全ての controller は try-catch で囲み、500 エラーを必ずログ出力する
 - クライアントには詳細なスタックトレースを返さない
@@ -643,6 +701,7 @@ erDiagram
   USER ||--o{ BATTLE : participates
   USER }o--|| LEAGUE : belongs_to
   LEAGUE ||--o{ BATTLE : contains
+  USER ||--o{ FOLLOWS : follows
 ```
 
 ---
@@ -662,12 +721,14 @@ erDiagram
 | `routes/timecircle.js` | タイムサークルエンドポイント定義 |
 | `routes/timeline.js` | タイムラインエンドポイント定義 |
 | `routes/league.js` | リーグ・バトルエンドポイント定義 |
+| `routes/follows.js` | フォローエンドポイント定義 |
 | `controllers/auth.js` | 認証ビジネスロジック |
 | `controllers/avatar.js` | アバタービジネスロジック |
 | `controllers/tasks.js` | タスクビジネスロジック |
 | `controllers/timecircle.js` | タイムサークルビジネスロジック |
 | `controllers/timeline.js` | タイムラインビジネスロジック |
 | `controllers/league.js` | リーグ・バトルビジネスロジック |
+| `controllers/follows.js` | フォロービジネスロジック |
 | `batch/dailyBattle.js` | デイリーバトルバッチ処理 (node-cron) |
 
 ### 15.2 フロントエンド (`apps/mobile/`)
@@ -731,15 +792,14 @@ erDiagram
 |---|---|
 | ユーザー登録 | アカウント作成・ログイン |
 | キャラクター作成 | タイプ選択・初期ステータス設定 |
-| タスク入力 | タスク名・カテゴリ・開始・終了時間の記録（2段階タイマー方式） |
+| タスク入力 | タスク名・カテゴリ・開始・終了時間の記録（2段階タイマー方式・end_timeはサーバー記録） |
 | タスクSNS投稿 | 公開設定付き投稿・タイムライン表示 |
 | タスクカテゴリ選択 | タスク作成時にカテゴリを手動選択・カテゴリ別EXP分配 |
 | タイムサークル表示 | 1日の時間を円グラフで可視化 |
 | ステータス成長 | EXP計算・タイプ補正込みのステータス更新 |
 | 自動バトル | デイリーバトルの実行・結果保存（00:00実行・06:00公開） |
 | リーグランキング | 勝率ベースの昇格・降格処理 |
-
-> **実装優先度の提案：** SNSのフォロー・タイムライン機能とバトル・ランキング機能を同時にMVPに含めると開発コストが高い。どちらかをv1.1に後回しにすることを検討してもよい。
+| フォロー機能 | ユーザーのフォロー・フォロー解除・一覧取得 |
 
 ---
 
