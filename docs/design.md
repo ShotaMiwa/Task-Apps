@@ -1,11 +1,14 @@
 # タスク成長型SNS PvPアプリ システム設計書
 
-**バージョン:** 1.4.0　　**作成日:** 2026年3月
+**バージョン:** 1.7.0　　**作成日:** 2026年3月
 
 ## 更新履歴
 
 | バージョン | 内容 |
 |---|---|
+| v1.7.0 | レビュー指摘反映（バトルフロー順序修正・battle_executions トランザクション明記・タスク終了の403定義・タイムゾーン明記・in_progress タスク扱い明記・勝率ゼロ除算対策・タイムサークル日付定義・battled_at 定義・タイムライン category 追加・GET /v1/league レスポンス修正） |
+| v1.6.0 | バッチ冪等性の設計を修正（battle_executions テーブルに分離・battles テーブルの誤ったUNIQUE INDEX・processed カラムを削除） |
+| v1.5.0 | 放置EXP上限・バッチ冪等性・トランザクション設計・インデックス定義・トークンハッシュ化・エラーコード細分化 |
 | v1.4.0 | end_time をサーバー記録方式に変更・フォロー機能追加（DB・ファイル構成・処理フロー） |
 | v1.3.0 | 勝率同率時の昇格・降格タイブレーカーを追加 |
 | v1.2.0 | 第2回レビュー指摘事項を反映 |
@@ -135,27 +138,43 @@
 | 2 | サーバーが DB から email でユーザーを検索 |
 | 3 | bcrypt でパスワードを検証 |
 | 4 | JWT アクセストークン (1h) とリフレッシュトークン (30d) を生成 |
-| 5 | リフレッシュトークンを `refresh_tokens` テーブルに保存 |
-| 6 | クライアントにトークンを返却 |
+| 5 | リフレッシュトークンを `bcrypt` でハッシュ化して `refresh_tokens` テーブルに保存 |
+| 6 | クライアントにトークンを返却（生のトークンはこの1回のみ返す） |
 | 7 | 以降のリクエストは `Authorization: Bearer {token}` を付与 |
-| 8 | アクセストークン期限切れ時は `POST /v1/auth/refresh` で再発行 |
+| 8 | アクセストークン期限切れ時は `POST /v1/auth/refresh` で再発行。受け取ったリフレッシュトークンを `bcrypt.compare` でDB内ハッシュと照合 |
 | 9 | ログアウト時は `POST /v1/auth/logout` を呼び `refresh_tokens` テーブルから該当レコードを削除 |
 
-### 6.2 タスク記録フロー
+### 6.2 タスク記録フロー（トランザクション）
+
+タスク終了処理は必ずトランザクション内で実行し、途中でエラーが発生した場合はロールバックする。
 
 | ステップ | 処理 |
 |---|---|
 | 1 | `POST /v1/tasks/start` でタスク名・カテゴリ・公開設定を送信 |
 | 2 | アバターが存在しない場合は `404 NOT_FOUND` を返す（message: "アバターが作成されていません"） |
-| 3 | サーバーが `start_time` を記録し `in_progress` 状態で保存 |
-| 4 | 未完了タスクが既に存在する場合は `409 CONFLICT` を返す（message: "進行中のタスクがあります。先に終了してください"） |
-| 5 | `PATCH /v1/tasks/:id/end` をリクエスト。`end_time = now()` をサーバーが記録 |
-| 6 | `duration_minutes = (end_time - start_time)` を自動計算 |
-| 7 | `exp = duration_minutes × 10` を計算 |
-| 8 | カテゴリの `ratio × exp` でステータス増加量を計算 |
-| 9 | キャラクタータイプの補正倍率を適用 |
-| 10 | `avatars` テーブルのステータスを更新 |
-| 11 | `league_memberships` の `last_task_at` を更新 |
+| 3 | 未完了タスクが既に存在する場合は `409 TASK_ALREADY_RUNNING` を返す（message: "進行中のタスクがあります。先に終了してください"） |
+| 4 | サーバーが `start_time` を記録し `in_progress` 状態で保存 |
+| 5 | `PATCH /v1/tasks/:id/end` をリクエスト。指定した `:id` のタスクが他ユーザーのものである場合は `403 FORBIDDEN`、存在しない場合は `404 NOT_FOUND` を返す |
+| 6 | `end_time = now()` をサーバーが記録 |
+| 7 | **BEGIN** トランザクション開始 |
+| 8 | `duration_minutes = (end_time - start_time)` を自動計算 |
+| 9 | `effective_minutes = min(duration_minutes, 180)` を計算 |
+| 10 | `exp = effective_minutes × 10` を計算 |
+| 11 | カテゴリの `ratio × exp` でステータス増加量を計算 |
+| 12 | キャラクタータイプの補正倍率を適用 |
+| 13 | `tasks` テーブルの `end_time` / `duration_minutes` / `effective_minutes` / `exp_gained` を更新 |
+| 14 | `avatars` テーブルのステータスを更新 |
+| 15 | `league_memberships` の `last_task_at` を更新 |
+| 16 | **COMMIT** トランザクション終了 |
+
+```sql
+-- タスク終了処理の擬似コード（ステップ7〜16）
+BEGIN;
+  UPDATE tasks SET end_time = now(), duration_minutes = ..., effective_minutes = ..., exp_gained = ... WHERE id = $1;
+  UPDATE avatars SET int = int + $2, str = str + $3, foc = foc + $4, spi = spi + $5 WHERE user_id = $6;
+  UPDATE league_memberships SET last_task_at = now() WHERE user_id = $6;
+COMMIT;
+```
 
 ### 6.3 フォローフロー
 
@@ -163,7 +182,7 @@
 |---|---|
 | 1 | `POST /v1/follows/:user_id` でフォロー対象を指定 |
 | 2 | `follower_id === followee_id` の場合は `400 VALIDATION_ERROR` を返す |
-| 3 | すでにフォロー済みの場合は `409 CONFLICT` を返す（DB の一意制約違反を利用） |
+| 3 | すでにフォロー済みの場合は `409 FOLLOW_ALREADY_EXISTS` を返す（DB の一意制約違反を利用） |
 | 4 | `follows` テーブルに `(follower_id, followee_id)` を挿入 |
 | 5 | フォロー解除は `DELETE /v1/follows/:user_id` でレコードを削除。存在しない場合は `404 NOT_FOUND` |
 
@@ -177,24 +196,26 @@
 | 4 | `visibility = private` のタスクは除外 |
 | 5 | `posted_at` 降順でソートして返却 |
 
-### 6.5 デイリーバトルフロー
+### 6.5 デイリーバトルフロー（冪等性保証）
 
-| 時刻 | ステップ | 処理 |
+> **タイムゾーン基準：** バトルスケジュール（00:00・06:00）およびアクティブユーザー判定の「3日以内」はすべて **JST（UTC+9）** を基準とする。
+
+| 時刻 (JST) | ステップ | 処理 |
 |---|---|---|
-| 00:00 | 1 | アクティブユーザー（3日以内にタスクあり）を取得 |
-| 00:00 | 2 | リーグごとにユーザーをリストアップ |
-| 00:00 | 3 | リーグ内ユーザーが2人未満の場合はそのリーグのバトルをスキップ |
-| 00:00 | 4 | リーグ内ユーザーをランダムにシャッフルしてペアを組む（奇数の場合は1人バイ） |
-| 00:00 | 5 | 各ペアで5回バトルを実施 |
-| 00:00 | 6 | `base_power = INT×1.1 + STR×1.0 + FOC×1.2 + SPI×1.0` を計算 |
+| 00:00 | 1 | `battle_executions` テーブルに `battle_date = today` のレコードが存在する場合はスキップ（2重実行防止） |
+| 00:00 | 2 | アクティブユーザー（3日以内にタスクあり）を取得 |
+| 00:00 | 3 | リーグごとにユーザーをリストアップ |
+| 00:00 | 4 | リーグ内ユーザーが2人未満の場合はそのリーグのバトルをスキップ |
+| 00:00 | 5 | リーグ内ユーザーをランダムにシャッフルしてペアを組む（奇数の場合は1人バイ） |
+| 00:00 | 6 | 各ペアの `base_power = INT×1.1 + STR×1.0 + FOC×1.2 + SPI×1.0` を計算 |
 | 00:00 | 7 | `random_range = floor(base_power × 0.1)` のランダム幅を加算した power で1戦ごとに勝敗を決定 |
 | 00:00 | 8 | 両者の power が完全に同値の場合はランダムで勝者を決定 |
-| 00:00 | 9 | 5回中3勝以上した方をペアの勝者とする |
-| 00:00 | 10 | `is_published = false` のまま `battles` テーブルに保存（非公開） |
+| 00:00 | 9 | 5回バトルを実施し、3勝以上した方をペアの勝者とする |
+| 00:00 | 10 | **トランザクション内で** 全ペアを `battles` テーブルに `is_published = false` で保存し、同一トランザクション内で `battle_executions` に `battle_date = today` を INSERT |
 | 06:00 | 11 | `is_published = true` に更新 |
 | 06:00 | 12 | `league_memberships` の `wins` / `losses` / `match_count` を更新 |
-| 06:00 | 13 | 昇格: 勝率（`wins / match_count`）上位 `floor(リーグ人数 × 0.2)` 人を上位リーグへ（S リーグは昇格なし）。同率の場合は総戦闘力（`base_power`）で判断 |
-| 06:00 | 14 | 降格: 勝率（`wins / match_count`）下位 `floor(リーグ人数 × 0.2)` 人を下位リーグへ（C リーグは降格なし）。同率の場合は総戦闘力（`base_power`）で判断 |
+| 06:00 | 13 | 昇格: 勝率（`wins / match_count`）上位 `floor(リーグ人数 × 0.2)` 人を上位リーグへ（S リーグは昇格なし）。同率の場合は総戦闘力（`base_power`）で判断。`match_count = 0` のユーザーは昇格対象外。 |
+| 06:00 | 14 | 降格: 勝率（`wins / match_count`）下位 `floor(リーグ人数 × 0.2)` 人を下位リーグへ（C リーグは降格なし）。同率の場合は総戦闘力（`base_power`）で判断。`match_count = 0` のユーザーは降格対象外。 |
 
 ### 6.6 マッチング詳細
 
@@ -213,7 +234,8 @@
 ### 7.1 EXP 計算
 
 ```
-exp = duration_minutes × 10
+effective_minutes = min(duration_minutes, 180)
+exp = effective_minutes × 10
 ```
 
 ### 7.2 ステータス分配（カテゴリ別）
@@ -245,7 +267,7 @@ level = floor( sqrt(total_exp / 100) )
 
 ---
 
-## 8. DBテーブル定義
+## 8. DBテーブル定義・インデックス
 
 ### 8.1 follows テーブル
 
@@ -255,9 +277,75 @@ CREATE TABLE follows (
   followee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (follower_id, followee_id),
-  CHECK (follower_id <> followee_id)  -- 自己フォロー防止
+  CHECK (follower_id <> followee_id)
 );
 ```
+
+### 8.2 battle_executions テーブル（バッチ冪等性管理）
+
+バッチの2重実行を防ぐための専用テーブル。`battles` テーブルは1日に複数レコードを持つため、冪等性の管理を分離している。
+
+```sql
+CREATE TABLE battle_executions (
+  battle_date DATE PRIMARY KEY,
+  executed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+バッチ処理の冪等チェックと保存は以下の流れで行う。**`battles` への全ペア保存と `battle_executions` への INSERT は同一トランザクション内で実行すること。** これにより、COMMIT前のクラッシュ時はロールバックされ、復旧後の再実行で正常に処理される。
+
+```js
+// バッチ開始時：実行済みチェック
+const already = await db.query(
+  'SELECT 1 FROM battle_executions WHERE battle_date = $1',
+  [today]
+);
+if (already.rows.length > 0) return; // スキップ
+
+// 全ペアのバトル計算後：トランザクションで一括保存
+const client = await db.connect();
+try {
+  await client.query('BEGIN');
+
+  // 全ペアを battles テーブルに保存
+  for (const battle of battleResults) {
+    await client.query(
+      'INSERT INTO battles (...) VALUES (...)',
+      [...]
+    );
+  }
+
+  // 同一トランザクション内で実行済みを記録
+  await client.query(
+    'INSERT INTO battle_executions (battle_date) VALUES ($1)',
+    [today]
+  );
+
+  await client.query('COMMIT');
+} catch (err) {
+  await client.query('ROLLBACK');
+  throw err;
+} finally {
+  client.release();
+}
+```
+
+### 8.3 インデックス定義
+
+タイムライン取得・フォロー参照のパフォーマンスを確保するために以下のインデックスを定義する。
+
+```sql
+-- タイムライン取得用：visibility でフィルタし posted_at 降順ソート
+CREATE INDEX tasks_visibility_posted_at_idx ON tasks(visibility, posted_at DESC);
+
+-- フォロー参照用：follower_id でフォロー先を高速検索
+CREATE INDEX follows_follower_id_idx ON follows(follower_id);
+
+-- フォロワー参照用：followee_id でフォロワーを高速検索
+CREATE INDEX follows_followee_id_idx ON follows(followee_id);
+```
+
+> **スケーラビリティ注記：** 上記インデックスにより数万件規模までは問題なく動作する。それ以上のスケールではfanoutアーキテクチャまたはキャッシュ層が必要（v2以降で検討）。
 
 ---
 
@@ -269,22 +357,33 @@ CREATE TABLE follows (
 | 401 | `UNAUTHORIZED` | 認証失敗・トークン期限切れ・無効 |
 | 403 | `FORBIDDEN` | アクセス権限なし |
 | 404 | `NOT_FOUND` | リソースが存在しない |
-| 409 | `CONFLICT` | 重複登録（アバター作成済み・タスク進行中・フォロー済み） |
+| 409 | `TASK_ALREADY_RUNNING` | 進行中のタスクが既に存在する |
+| 409 | `FOLLOW_ALREADY_EXISTS` | すでにフォロー済み |
+| 409 | `AVATAR_ALREADY_EXISTS` | アバターが既に作成済み |
 | 500 | `INTERNAL_ERROR` | サーバー内部エラー |
 
 ### 9.1 エラーレスポンス共通形式
 
 ```json
-{ "error": { "code": "UNAUTHORIZED", "message": "認証トークンが無効です" } }
+{ "error": { "code": "TASK_ALREADY_RUNNING", "message": "進行中のタスクがあります。先に終了してください" } }
 ```
 
-### 9.2 方針
+### 9.2 409サブコードの判別方法
+
+DB の一意制約違反（`err.code === "23505"`）が発生した場合、`err.constraint` の制約名でどの 409 を返すか判別する。
+
+| 制約名 | 返すコード |
+|---|---|
+| `tasks_user_id_active_unique`（未終了タスク制約） | `TASK_ALREADY_RUNNING` |
+| `follows_pkey`（フォロー複合主キー制約） | `FOLLOW_ALREADY_EXISTS` |
+| `avatars_user_id_unique`（アバター一意制約） | `AVATAR_ALREADY_EXISTS` |
+
+### 9.3 方針
 
 - 全ての controller は try-catch で囲み、500 エラーを必ずログ出力する
 - クライアントには詳細なスタックトレースを返さない
-- DB の一意制約違反 (`err.code === "23505"`) は 409 として返す
 - JWT 検証失敗 (`JsonWebTokenError` / `TokenExpiredError`) は 401 として返す
-- 409 CONFLICT のメッセージはユーザーが次に取るべき行動を明示する
+- 409 のメッセージはユーザーが次に取るべき行動を明示する
 
 ---
 
