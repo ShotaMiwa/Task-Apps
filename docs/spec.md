@@ -1,11 +1,12 @@
 # タスク成長型SNS PvPアプリ 仕様書（MVP）
 
-**バージョン:** 2.4.0　　**作成日:** 2026年3月
+**バージョン:** 2.5.0　　**作成日:** 2026年3月
 
 ## 更新履歴
 
 | バージョン | 内容 |
 |---|---|
+| v2.5.0 | 技術スタック改善反映（開発環境をDocker統一・バッチを別コンテナに分離・本番インフラをVPS移行方針に変更） |
 | v2.4.0 | レビュー指摘反映（in_progress タスクのバトル計算除外を明記・DELETE /v1/tasks/:id の仕様追加・リフレッシュトークンローテーション方針を注記・GET /v1/tasks の date パラメータ JST 基準を明記・少人数リーグの昇格0人問題を注記） |
 | v2.3.0 | レビュー指摘反映（バトルフロー順序修正・battle_executions トランザクション明記・タスク終了の403定義・タイムゾーン明記・in_progress タスク扱い明記・勝率ゼロ除算対策・タイムサークル日付定義・battled_at 定義・タイムライン category 追加・GET /v1/league レスポンス修正） |
 | v2.2.1 | バッチ冪等性の設計を修正（battle_executions テーブルに分離・battles テーブルの誤ったUNIQUE INDEX・processed カラムを削除） |
@@ -46,12 +47,12 @@ flowchart TD
 | レイヤー | 技術 | 備考 |
 |---|---|---|
 | フロントエンド | Expo (React Native) | iOS / Android |
-| バックエンド | Node.js + Express | REST API |
+| バックエンド | Node.js + Express | REST API・Docker コンテナ |
 | データベース | PostgreSQL 16 | Docker コンテナ |
-| バッチ処理 | node-cron | デイリーバトル |
+| バッチ処理 | node-cron | デイリーバトル・APIとは別コンテナで動作 |
 | 認証 | JWT (Bearer Token) | アクセス1h / リフレッシュ30d |
-| インフラ（本番） | 自宅PC + Cloudflare Tunnel | Docker Compose |
-| 開発環境 | Docker (DB のみ) + ローカル API | nodemon で自動再起動 |
+| インフラ（本番） | VPS | Docker Compose・本番運用時に移行 |
+| 開発環境 | Docker Compose（全コンテナ統一） | ボリュームマウント + nodemon で自動再起動 |
 
 ---
 
@@ -61,20 +62,44 @@ flowchart TD
 
 | コンポーネント | 場所 | 起動方法 |
 |---|---|---|
-| PostgreSQL | Docker コンテナ | `docker compose up db -d` |
-| Express API | ローカル (WSL2) | `npm run dev` |
+| PostgreSQL | Docker コンテナ | `docker compose up` |
+| Express API | Docker コンテナ（ボリュームマウント） | `docker compose up` |
+| バッチ処理 | Docker コンテナ（API とは別） | `docker compose up` |
 | Expo | ローカル (各自の PC) | `expo start` |
+
+> **開発環境の統一：** API・バッチ・DB をすべて Docker Compose で管理する。`apps/api` ディレクトリをコンテナ内にボリュームマウントすることで、ローカルでファイルを編集すると nodemon が自動検知してサーバーを再起動する。Node.js のローカルインストールは不要。
+
+```yaml
+# docker-compose.yml（開発環境）の構成例
+services:
+  api:
+    build: ./apps/api
+    volumes:
+      - ./apps/api:/app
+    command: npx nodemon src/index.js
+    depends_on:
+      - db
+  batch:
+    build: ./apps/api
+    volumes:
+      - ./apps/api:/app
+    command: node src/batch/dailyBattle.js
+    depends_on:
+      - db
+  db:
+    image: postgres:16
+```
 
 ### 4.2 本番環境
 
 | コンポーネント | 場所 | 起動方法 |
 |---|---|---|
-| PostgreSQL | Docker コンテナ (自宅PC) | `docker compose up` |
-| Express API | Docker コンテナ (自宅PC) | `docker compose up` |
-| Cloudflare Tunnel | 自宅PC | `cloudflared tunnel run` |
+| PostgreSQL | Docker コンテナ (VPS) | `docker compose up` |
+| Express API | Docker コンテナ (VPS) | `docker compose up` |
+| バッチ処理 | Docker コンテナ (VPS・API とは別) | `docker compose up` |
 | Expo | ユーザーのスマートフォン | Expo Go / スタンドアロンビルド |
 
-> **Cloudflare Tunnel の注意点：** 自宅PCのシャットダウン・スリープ中はAPIが停止する。MVPでは許容範囲だが、本番運用時はサーバーの常時稼働を担保する仕組みが必要。
+> **本番インフラの方針：** MVP期間中は自宅PC + Cloudflare Tunnel での稼働を許容する。ユーザー公開・本番運用のタイミングで VPS（Railway・Fly.io・さくらVPS 等）に移行する。docker-compose.yml の構成はそのまま流用できるため、移行時のコード変更は不要。VPS に移行することで自宅PCのスリープ・シャットダウンによるバッチ停止問題が解消される。
 
 ### 4.3 構成図
 
@@ -84,19 +109,14 @@ flowchart TD
     A[Expo アプリ]
   end
 
-  subgraph Cloudflare
-    F[Cloudflare Tunnel]
-  end
-
-  subgraph HomePC["自宅PC"]
-    B[Express API サーバー]
-    C[node-cron\nデイリーバトル]
-    D[(PostgreSQL)]
+  subgraph VPS["VPS（本番） / 自宅PC（MVP期間）"]
+    B[Express API サーバー\nDockerコンテナ]
+    C[node-cron バッチ\nDockerコンテナ（別）]
+    D[(PostgreSQL\nDockerコンテナ)]
     E[ローカルストレージ\nキャラクター画像]
   end
 
-  A -->|HTTPS| F
-  F -->|トンネル経由| B
+  A -->|HTTPS| B
   B --> D
   B --> E
   C --> D
